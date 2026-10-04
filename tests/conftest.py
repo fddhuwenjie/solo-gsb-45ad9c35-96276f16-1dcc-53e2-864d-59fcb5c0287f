@@ -49,6 +49,7 @@ def make_token(
     not_before: str = "2026-01-01T00:00:00Z",
     not_after: str = "2026-12-31T23:59:59Z",
     chain_id: str = "chain-1",
+    secret: str | None = None,
 ) -> dict:
     from app.security import compute_signature
 
@@ -66,5 +67,5 @@ def make_token(
         "allow_ip": allow_ip,
         "signature": "",
     }
-    t["signature"] = compute_signature(t, SECRETS[issuer])
+    t["signature"] = compute_signature(t, secret if secret is not None else SECRETS[issuer])
     return t

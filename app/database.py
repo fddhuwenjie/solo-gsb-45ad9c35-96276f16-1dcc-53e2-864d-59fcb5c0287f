@@ -1,9 +1,10 @@
-"""SQLite 持久层：主体密钥、能力链及完整性报告。"""
+"""SQLite 持久层：主体密钥（含代次历史）、能力链及完整性报告。"""
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+from collections.abc import Iterable
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
@@ -19,8 +20,9 @@ from .models import (
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS principals (
-    name        TEXT PRIMARY KEY,
-    hmac_secret TEXT NOT NULL
+    name               TEXT PRIMARY KEY,
+    hmac_secret        TEXT NOT NULL,
+    current_generation INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS chains (
@@ -35,6 +37,27 @@ CREATE TABLE IF NOT EXISTS tokens (
     position    INTEGER NOT NULL,
     token_json  TEXT NOT NULL,
     PRIMARY KEY (chain_id, position),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
+
+-- 主体 HMAC 密钥的完整代次历史（只追加）：注册为第 1 代，每次轮换追加一代并
+-- 切换 principals.current_generation；旧代次永久保留，供轮换前提交的链重验。
+CREATE TABLE IF NOT EXISTS principal_keys (
+    principal    TEXT NOT NULL,
+    generation   INTEGER NOT NULL,
+    hmac_secret  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (principal, generation),
+    FOREIGN KEY (principal) REFERENCES principals (name)
+);
+
+-- 每条链在提交时锁定的“签发主体 -> 密钥代次”归属（随链写入，之后不可变）。
+-- 链重放 / 求值 / 核销重验签名时按此归属取密钥：轮换不改变既有链的验签结论。
+CREATE TABLE IF NOT EXISTS chain_key_generations (
+    chain_id   TEXT NOT NULL,
+    principal  TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (chain_id, principal),
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 
@@ -122,12 +145,46 @@ def get_db() -> Iterator[sqlite3.Connection]:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_principals(conn)
     if settings.seed_demo_principals:
         conn.executemany(
             "INSERT OR IGNORE INTO principals (name, hmac_secret) VALUES (?, ?)",
             list(DEMO_PRINCIPALS.items()),
         )
+    _backfill_key_tables(conn)
     conn.commit()
+
+
+def _migrate_principals(conn: sqlite3.Connection) -> None:
+    """为轮换功能上线前创建的既有库补充 current_generation 列（已有数据归一到第 1 代）。"""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(principals)")}
+    if "current_generation" not in cols:
+        conn.execute(
+            "ALTER TABLE principals "
+            "ADD COLUMN current_generation INTEGER NOT NULL DEFAULT 1"
+        )
+
+
+def _backfill_key_tables(conn: sqlite3.Connection) -> None:
+    """把轮换功能上线前的数据归一到第 1 代密钥（幂等，可每次启动执行）。
+
+    - 尚无密钥历史的主体：以其当前 hmac_secret 作为第 1 代（轮换过的主体已有
+      历史行，INSERT OR IGNORE 自然跳过，不会用当前密钥覆盖旧代次）；
+    - 既有链：按提交内出现且当时已注册的签发者，归属到第 1 代。
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR IGNORE INTO principal_keys "
+        "(principal, generation, hmac_secret, created_at) "
+        "SELECT name, 1, hmac_secret, ? FROM principals",
+        (now,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO chain_key_generations (chain_id, principal, generation) "
+        "SELECT DISTINCT t.chain_id, json_extract(t.token_json, '$.issuer'), 1 "
+        "FROM tokens t JOIN principals p "
+        "ON p.name = json_extract(t.token_json, '$.issuer')"
+    )
 
 
 def get_secret(conn: sqlite3.Connection, name: str) -> str | None:
@@ -138,12 +195,97 @@ def get_secret(conn: sqlite3.Connection, name: str) -> str | None:
 
 
 def upsert_principal(conn: sqlite3.Connection, name: str, secret: str) -> bool:
-    """注册主体；已存在返回 False。"""
+    """注册主体并安装其第 1 代密钥（同一事务）；已存在返回 False。"""
     cur = conn.execute(
         "INSERT INTO principals (name, hmac_secret) VALUES (?, ?)",
         (name, secret),
     )
+    if cur.rowcount == 1:
+        conn.execute(
+            "INSERT INTO principal_keys "
+            "(principal, generation, hmac_secret, created_at) "
+            "VALUES (?, 1, ?, ?)",
+            (name, secret, datetime.now(timezone.utc).isoformat()),
+        )
     return cur.rowcount == 1
+
+
+# --------------------------------------------------------------------------- #
+# 密钥代次：当前快照、按代次取钥、原子轮换
+# --------------------------------------------------------------------------- #
+def get_principal_key_row(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    """主体的当前密钥行（name / hmac_secret / current_generation）；不存在返回 None。"""
+    return conn.execute(
+        "SELECT name, hmac_secret, current_generation FROM principals WHERE name = ?",
+        (name,),
+    ).fetchone()
+
+
+def install_next_key_generation(
+    conn: sqlite3.Connection, name: str, new_secret: str
+) -> tuple[int, datetime]:
+    """为主体安装新一代密钥并切换为当前代，返回 (新代次, 安装时间)。
+
+    历史追加与当前代切换在同一事务内提交；调用方负责开启写事务
+    （``BEGIN IMMEDIATE``）并在失败时回滚——任何失败都不会留下部分切换。
+    """
+    row = get_principal_key_row(conn, name)
+    assert row is not None, "install_next_key_generation 前须确认主体存在"
+    new_generation = row["current_generation"] + 1
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO principal_keys "
+        "(principal, generation, hmac_secret, created_at) VALUES (?, ?, ?, ?)",
+        (name, new_generation, new_secret, now.isoformat()),
+    )
+    conn.execute(
+        "UPDATE principals SET hmac_secret = ?, current_generation = ? WHERE name = ?",
+        (new_secret, new_generation, name),
+    )
+    return new_generation, now
+
+
+def snapshot_current_keys(
+    conn: sqlite3.Connection, names: Iterable[str]
+) -> dict[str, tuple[str, int]]:
+    """当前密钥快照：``{主体名: (密钥, 代次)}``；未注册主体不出现在结果中。
+
+    链提交时先取快照再验签、再把快照中的代次随链持久化，保证与并发轮换
+    交错时“验签用哪一代密钥，归属就记哪一代”。
+    """
+    unique = sorted(set(names))
+    if not unique:
+        return {}
+    placeholders = ", ".join("?" for _ in unique)
+    rows = conn.execute(
+        "SELECT name, hmac_secret, current_generation FROM principals "
+        f"WHERE name IN ({placeholders})",
+        unique,
+    ).fetchall()
+    return {r["name"]: (r["hmac_secret"], r["current_generation"]) for r in rows}
+
+
+def get_secret_at_generation(
+    conn: sqlite3.Connection, name: str, generation: int
+) -> str | None:
+    """指定代次的密钥；主体或该代次不存在时返回 None。"""
+    row = conn.execute(
+        "SELECT hmac_secret FROM principal_keys "
+        "WHERE principal = ? AND generation = ?",
+        (name, generation),
+    ).fetchone()
+    return row["hmac_secret"] if row else None
+
+
+def load_chain_key_generations(
+    conn: sqlite3.Connection, chain_id: str
+) -> dict[str, int]:
+    """链在提交时锁定的 ``{签发主体: 密钥代次}`` 归属（无记录时为空 dict）。"""
+    rows = conn.execute(
+        "SELECT principal, generation FROM chain_key_generations WHERE chain_id = ?",
+        (chain_id,),
+    ).fetchall()
+    return {r["principal"]: r["generation"] for r in rows}
 
 
 def save_chain(
@@ -151,7 +293,9 @@ def save_chain(
     submission: ChainSubmission,
     content_sha256: str,
     report: IntegrityReport,
+    key_generations: dict[str, int],
 ) -> None:
+    """持久化链及其提交时锁定的密钥代次归属（同一事务，要么全部落库要么都不落）。"""
     created_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO chains (chain_id, content_sha256, report_json, created_at) "
@@ -168,6 +312,14 @@ def save_chain(
         [
             (submission.chain_id, i, t.model_dump_json())
             for i, t in enumerate(submission.tokens)
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO chain_key_generations (chain_id, principal, generation) "
+        "VALUES (?, ?, ?)",
+        [
+            (submission.chain_id, name, generation)
+            for name, generation in sorted(key_generations.items())
         ],
     )
 

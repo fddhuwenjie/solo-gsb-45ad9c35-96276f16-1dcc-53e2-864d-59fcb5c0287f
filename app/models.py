@@ -328,6 +328,22 @@ class PrincipalOut(BaseModel):
     name: str
 
 
+class KeyRotationIn(BaseModel):
+    """主体 HMAC 密钥轮换请求（主体名取自 URL 路径）。"""
+
+    hmac_secret: str = Field(
+        min_length=1, description="新的 HMAC 密钥；必须与当前密钥不同"
+    )
+
+
+class PrincipalRotationOut(BaseModel):
+    """密钥轮换结果（响应不携带任何密钥材料）。"""
+
+    name: str
+    generation: int = Field(description="轮换后的当前密钥代次（注册为 1，每次轮换 +1）")
+    rotated_at: datetime = Field(description="轮换生效时间（UTC）")
+
+
 class ConflictDetail(BaseModel):
     detail: str
     chain_id: str

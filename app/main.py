@@ -1,4 +1,4 @@
-"""FastAPI 应用：提交能力链、幂等重放、冲突检测、撤销审计与请求级判定。"""
+"""FastAPI 应用：提交能力链、幂等重放、冲突检测、撤销审计、请求级判定与密钥轮换。"""
 from __future__ import annotations
 
 import json
@@ -12,10 +12,14 @@ from fastapi.responses import JSONResponse
 from .database import (
     get_conn,
     get_db,
+    get_principal_key_row,
     get_secret,
+    get_secret_at_generation,
     init_db,
     insert_redemption,
     insert_revocation,
+    install_next_key_generation,
+    load_chain_key_generations,
     load_chain_record,
     load_redemption_by_request_key,
     load_redemption_for_token,
@@ -25,6 +29,7 @@ from .database import (
     load_revocations,
     load_submission,
     save_chain,
+    snapshot_current_keys,
     token_exists,
     upsert_principal,
 )
@@ -35,8 +40,10 @@ from .models import (
     ConflictDetail,
     EvaluateRequest,
     EvaluateResult,
+    KeyRotationIn,
     PrincipalIn,
     PrincipalOut,
+    PrincipalRotationOut,
     RedemptionEvent,
     RedeemRequest,
     RedeemResult,
@@ -63,15 +70,31 @@ app = FastAPI(
     description=(
         "客户端提交根授权和以 parent_id 相连的委托令牌；服务验签、检测断链与环，"
         "并强制路径 / 方法 / 时间窗 / IP 网段只能逐级收窄。"
-        "支持按时间生效的不可变撤销事件、请求级判定，以及链末端令牌的一次性访问核销。"
+        "支持按时间生效的不可变撤销事件、请求级判定、链末端令牌的一次性访问核销，"
+        "以及按代次管理的签发主体 HMAC 密钥轮换（既有链按提交时锁定的代次重验）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
 
-def _secret_lookup(conn: sqlite3.Connection):
-    return lambda name: get_secret(conn, name)
+def _chain_secret_lookup(conn: sqlite3.Connection, chain_id: str):
+    """按链提交时锁定的密钥代次构造验签查询。
+
+    - 提交时已注册的主体：固定使用链归属记录中的那一代密钥——轮换不影响
+      既有链的验签结论，既有无效链也不会因新密钥恰好匹配而翻转为有效；
+    - 提交时未注册的主体（无归属记录）：回退到当前密钥，保留“主体后注册
+      可补验”的既有语义。
+    """
+    recorded = load_chain_key_generations(conn, chain_id)
+
+    def lookup(name: str) -> str | None:
+        generation = recorded.get(name)
+        if generation is None:
+            return get_secret(conn, name)
+        return get_secret_at_generation(conn, name, generation)
+
+    return lookup
 
 
 @app.get("/health")
@@ -96,6 +119,36 @@ def register_principal(
     return PrincipalOut(name=payload.name)
 
 
+@app.post("/api/v1/principals/{name}/rotate-key", response_model=PrincipalRotationOut)
+def rotate_principal_key(
+    name: str, payload: KeyRotationIn, conn: sqlite3.Connection = Depends(get_db)
+) -> PrincipalRotationOut:
+    """轮换已注册主体的 HMAC 密钥：原子安装新一代密钥并切换为当前代。
+
+    - 轮换后**新提交**的链只按新密钥验签（旧密钥签出的新链得到 ``bad_signature``）；
+    - 轮换前已保存的链按提交时锁定的代次继续用原密钥重验，结论不变；
+    - 整个切换在同一事务（``BEGIN IMMEDIATE``）内完成：主体不存在（404）、
+      新密钥与当前相同（409）或任何写失败都不会留下部分切换；
+    - 响应只包含主体名、新代次与轮换时间，不回显密钥。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    row = get_principal_key_row(conn, name)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"主体 {name!r} 不存在，无法轮换密钥",
+        )
+    if payload.hmac_secret == row["hmac_secret"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="新密钥与当前密钥相同；轮换未执行",
+        )
+    generation, rotated_at = install_next_key_generation(
+        conn, name, payload.hmac_secret
+    )
+    return PrincipalRotationOut(name=name, generation=generation, rotated_at=rotated_at)
+
+
 @app.post(
     "/api/v1/chains",
     response_model=SubmissionResult,
@@ -111,16 +164,21 @@ def submit_chain(
     - 相同 chain_id 且内容完全一致：幂等返回 200，``replayed=true``；
     - 相同 chain_id 但内容变化：返回 409 冲突；
     - 新 chain_id：持久化并返回 201。完整性失败也会持久化（含失败轨迹）。
+
+    验签严格使用“提交时各签发主体的当前密钥代次”快照，并把该代次归属随链
+    持久化：与并发轮换交错时，链的密钥归属与提交时的验签结果始终一致。
     """
     received_hash = canonical_submission_hash(
         submission.chain_id, submission.tokens
     )
     existing_hash = _existing_hash(conn, submission.chain_id)
 
-    report, _ = validate_chain(submission, _secret_lookup(conn))
-
     if existing_hash is not None:
         if existing_hash == received_hash:
+            # 幂等重放：按链提交时锁定的密钥代次重验，结论与首次提交一致
+            report, _ = validate_chain(
+                submission, _chain_secret_lookup(conn, submission.chain_id)
+            )
             result = SubmissionResult(
                 chain_id=submission.chain_id, replayed=True, integrity=report
             )
@@ -141,7 +199,21 @@ def submit_chain(
             },
         )
 
-    save_chain(conn, submission, received_hash, report)
+    # 新链：先快照各签发主体的当前密钥与代次，验签与归属记录使用同一快照
+    snapshot = snapshot_current_keys(
+        conn, {t.issuer for t in submission.tokens}
+    )
+    report, _ = validate_chain(
+        submission,
+        lambda name: snapshot[name][0] if name in snapshot else None,
+    )
+    save_chain(
+        conn,
+        submission,
+        received_hash,
+        report,
+        {name: generation for name, (_, generation) in snapshot.items()},
+    )
     result = SubmissionResult(
         chain_id=submission.chain_id, replayed=False, integrity=report
     )
@@ -179,7 +251,7 @@ def evaluate_chain(
         raise HTTPException(status_code=404, detail=f"chain_id {chain_id!r} 不存在")
     revocations = load_revocations(conn, chain_id)
     return evaluate_request(
-        submission, payload, _secret_lookup(conn), revocations=revocations
+        submission, payload, _chain_secret_lookup(conn, chain_id), revocations=revocations
     )
 
 
@@ -289,6 +361,7 @@ def redeem_chain(
         )
 
     # 6) 以接收时刻重算现有验签 / 收窄 / 撤销 / 请求级权限
+    #    （验签按链提交时锁定的密钥代次取钥，轮换不改变既有链结论）
     now = datetime.now(timezone.utc)
     evaluation = EvaluateRequest(
         request_path=payload.request_path,
@@ -300,7 +373,7 @@ def redeem_chain(
     decision = evaluate_request(
         submission,
         evaluation,
-        _secret_lookup(conn),
+        _chain_secret_lookup(conn, chain_id),
         revocations=load_revocations(conn, chain_id),
     )
 

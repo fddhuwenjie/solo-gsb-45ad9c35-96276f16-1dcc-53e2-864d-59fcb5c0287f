@@ -3,7 +3,7 @@
 客户端提交一条**根授权**和若干以 `parent_id` 相连的**委托令牌（capability token）**。
 服务端完成：
 
-1. **HMAC-SHA256 验签** —— 对规范化 JSON 报文验签（每主体独立密钥）；
+1. **HMAC-SHA256 验签** —— 对规范化 JSON 报文验签（每主体独立密钥，按代次管理）；
 2. **签发者检查** —— 根授权必须由配置的根主体签发；委托令牌的 `issuer` 必须等于父令牌的 `subject`；
 3. **结构检查** —— 断链、重复 id、多根、分叉、环、与根不可达；
 4. **逐级收窄** —— 子令牌的路径模式、HTTP 方法集合、时间窗、`allow_ip` CIDR 只能比父令牌更窄；
@@ -13,7 +13,10 @@
 7. **一次性访问核销** —— 对已提交链的**末端令牌**执行一次性核销：以服务端接收时刻重算全部判定，
    仅在末端且允许时记录核销；同一令牌只能成功核销一次（并发仅一笔成功），
    `request_key` 成功重放返回首次结果（即使令牌随后过期 / 被撤销），换内容冲突；
-   判定拒绝与目标不符均不核销、不占用 `request_key`。
+   判定拒绝与目标不符均不核销、不占用 `request_key`；
+8. **HMAC 密钥轮换** —— 签发主体的密钥按**代次**管理：注册为第 1 代，每次轮换原子地追加一代并切换当前代。
+   轮换后新提交的链只按新密钥验签；每条链在提交时锁定各签发主体的密钥代次，
+   轮换前保存的链在链查询、只读求值与首次核销中继续按锁定代次的密钥重验，结论不变。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -141,7 +144,40 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 { "name": "service-a", "hmac_secret": "s3cr3t" }
 ```
 
-- `201` 注册成功；`409` 主体已存在。
+- `201` 注册成功（密钥安装为第 1 代）；`409` 主体已存在。
+
+### `POST /api/v1/principals/{name}/rotate-key`
+
+轮换已注册主体的 HMAC 密钥（`name` 取自 URL 路径）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/principals/service-a/rotate-key \
+  -H 'Content-Type: application/json' \
+  -d '{"hmac_secret": "s3cr3t-v2"}'
+```
+
+```json
+{ "name": "service-a", "generation": 2, "rotated_at": "2026-10-04T09:00:00+00:00" }
+```
+
+- `200 OK`：新一代密钥已**原子**安装并切换为当前代，响应含新代次与轮换时间（**不回显密钥**）；
+- `404 Not Found`：主体未注册；
+- `409 Conflict`：新密钥与当前密钥相同（未执行任何切换）；
+- `422`：请求体校验失败（如空密钥）。
+
+**轮换语义（代次模型）**：
+
+- 密钥按代次管理：注册为第 1 代，每次轮换 `+1`；全部代次**只追加、永不修改或删除**；
+- 轮换后**新提交**的链只按当前（新）密钥验签——用旧密钥签出的新链得到 `bad_signature`；
+- 每条链在**提交时**锁定各签发主体的密钥代次并随链持久化；轮换前保存的链在
+  **链查询、只读求值、首次核销**中继续按锁定代次的密钥重验，验签结论与轮换前一致，
+  撤销事件照常按请求时间解释；既有**无效**链不会因为新密钥恰好匹配而翻转为有效；
+- 轮换与链提交并发交错时，链记录的密钥代次严格等于提交时实际验签所用的代次；
+- 轮换在单个 `BEGIN IMMEDIATE` 事务内完成：失败（404 / 409 / 写冲突）不会留下部分切换；
+- 已核销请求的同键同内容重放仍返回首次结果（与轮换无关）；任何响应都不携带密钥材料。
+
+轮换前后的完整可执行示例（签名 → 提交 → 求值 → 核销）见下文
+[密钥轮换演练](#密钥轮换演练轮换前后签名求值与核销)。
 
 ### `POST /api/v1/chains`
 
@@ -389,6 +425,147 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/redeem \
 
 ---
 
+## 密钥轮换演练（轮换前后签名、求值与核销）
+
+下面是一套**可直接复制执行**的 bash 演练：注册主体 → 轮换前签名/提交/求值 → 轮换密钥 →
+验证既有链结论不变（查询 / 求值 / 首次核销 / 重放）→ 轮换后新旧密钥签名对比。
+假设服务已通过 `docker compose up --build` 启动在 `http://localhost:8000`，
+命令在仓库根目录执行（签名复用 `app.security`，需本地 Python 3.10+ 与 `pip install -r requirements.txt`）。
+
+```bash
+# 0) 注册演练主体 svc-demo（第 1 代密钥；已注册过会返回 409，可忽略或换个名字）
+curl -sS -X POST http://localhost:8000/api/v1/principals \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "svc-demo", "hmac_secret": "svc-demo-secret-v1"}'
+
+# 签名助手：生成 root -> svc-demo 的两级链，child 用 $2 指定的 svc-demo 密钥签名
+build_chain() {
+  PYTHONPATH=. CHAIN_ID="$1" SVC_SECRET="$2" python3 - <<'PY'
+import json, os
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+
+chain_id   = os.environ["CHAIN_ID"]
+svc_secret = os.environ["SVC_SECRET"]
+root_secret = os.environ.get("ROOT_HMAC_SECRET", "dev-root-secret-change-me")
+now = datetime.now(timezone.utc)
+nb = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+na = (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+
+def token(tid, parent, issuer, subject, path, methods, secret):
+    t = {
+        "token_id": tid, "parent_id": parent, "chain_id": chain_id,
+        "issuer": issuer, "subject": subject, "path_pattern": path,
+        "methods": methods, "not_before": nb, "not_after": na,
+        "allow_ip": None, "signature": "",
+    }
+    t["signature"] = compute_signature(t, secret)   # 规范化 JSON + HMAC-SHA256
+    return t
+
+print(json.dumps({
+    "chain_id": chain_id,
+    "tokens": [
+        token("rot-root",  None,       "root",     "svc-demo",
+              "/files/**", ["GET", "POST"], root_secret),
+        token("rot-child", "rot-root", "svc-demo", "svc-demo-worker",
+              "/files/reports/*", ["GET"], svc_secret),
+    ],
+}, ensure_ascii=False))
+PY
+}
+```
+
+### 轮换前：用第 1 代密钥签名、提交、求值
+
+```bash
+# 1) 用当前（第 1 代）密钥签名并提交
+build_chain rot-chain-before svc-demo-secret-v1 > /tmp/rot-before.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/rot-before.json
+# → 201，"integrity": {"allow": true, ...}
+
+# 2) 轮换前只读求值
+curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-before/evaluate \
+  -H 'Content-Type: application/json' \
+  -d "{\"request_path\": \"/files/reports/q1.pdf\", \"method\": \"GET\", \
+      \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+# → "decision": "allow"
+```
+
+### 轮换：原子切换到第 2 代密钥
+
+```bash
+# 3) 轮换 svc-demo 的 HMAC 密钥（响应不含密钥）
+curl -sS -X POST http://localhost:8000/api/v1/principals/svc-demo/rotate-key \
+  -H 'Content-Type: application/json' \
+  -d '{"hmac_secret": "svc-demo-secret-v2"}'
+# → 200 {"name": "svc-demo", "generation": 2, "rotated_at": "..."}
+```
+
+### 轮换后：既有链按提交时锁定的第 1 代密钥重验，结论不变
+
+```bash
+# 4a) 链查询：完整性报告仍是轮换前的验签结论
+curl -sS http://localhost:8000/api/v1/chains/rot-chain-before
+# → "integrity": {"allow": true, ...}
+
+# 4b) 只读求值：继续用第 1 代密钥重验，仍 allow
+curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-before/evaluate \
+  -H 'Content-Type: application/json' \
+  -d "{\"request_path\": \"/files/reports/q1.pdf\", \"method\": \"GET\", \
+      \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+# → "decision": "allow"
+
+# 4c) 首次核销：同样按第 1 代密钥重验，正常核销
+curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-before/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "rot-child", "request_key": "rot-redeem-0001",
+       "request_path": "/files/reports/q1.pdf", "method": "GET"}'
+# → 201，"redeemed": true
+
+# 4d) 同 request_key 同内容重放：仍返回首次结果（与轮换无关）
+curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-before/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "rot-child", "request_key": "rot-redeem-0001",
+       "request_path": "/files/reports/q1.pdf", "method": "GET"}'
+# → 200，"replayed": true，redeemed_at / 轨迹与首次完全一致
+```
+
+### 轮换后：新提交的链只按新密钥验签
+
+```bash
+# 5a) 旧密钥签出的新链：验签失败（bad_signature），失败结果同样持久化
+build_chain rot-chain-old-key svc-demo-secret-v1 > /tmp/rot-old-key.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/rot-old-key.json
+# → 201，"integrity": {"allow": false, "first_failed_reason": "bad_signature", ...}
+
+# 5b) 新密钥签出的新链：正常通过，求值 / 核销照常
+build_chain rot-chain-after svc-demo-secret-v2 > /tmp/rot-after.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/rot-after.json
+# → 201，"integrity": {"allow": true, ...}
+
+curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-after/evaluate \
+  -H 'Content-Type: application/json' \
+  -d "{\"request_path\": \"/files/reports/q1.pdf\", \"method\": \"GET\", \
+      \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+# → "decision": "allow"
+
+curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-after/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "rot-child", "request_key": "rot-redeem-0002",
+       "request_path": "/files/reports/q1.pdf", "method": "GET"}'
+# → 201，"redeemed": true
+```
+
+> 既有**无效**链也不会因新密钥恰好匹配而翻转：若某链提交时签名对当时的密钥无效，
+> 即使该签名恰好等于新密钥的 HMAC，链查询 / 求值 / 核销仍按提交时锁定的代次重验，
+> 结论保持 `bad_signature`（测试 `test_invalid_chain_does_not_turn_valid_when_new_key_happens_to_match`
+> 覆盖了这一场景）。撤销事件与轮换正交：轮换后追加的撤销照常按请求时间生效。
+
+---
+
 ## 规范化 JSON 与签名（重要）
 
 签名覆盖除 `signature` 外的下列字段（固定集合、固定键顺序无关，因为规范化时按键排序）：
@@ -475,14 +652,14 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销
+│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销/密钥轮换
 │   ├── models.py      # Pydantic 模型与输入校验
 │   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语、内容指纹
 │   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎、链末端识别与轨迹
-│   ├── database.py    # SQLite 初始化、主体/链/撤销/核销持久化
+│   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/核销持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：82 个用例（端到端 API、原语单测、撤销审计、一次性核销）
+├── tests/             # pytest：96 个用例（端到端 API、原语单测、撤销审计、一次性核销、密钥轮换）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
