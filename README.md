@@ -13,7 +13,12 @@
 7. **一次性访问核销** —— 对已提交链的**末端令牌**执行一次性核销：以服务端接收时刻重算全部判定，
    仅在末端且允许时记录核销；同一令牌只能成功核销一次（并发仅一笔成功），
    `request_key` 成功重放返回首次结果（即使令牌随后过期 / 被撤销），换内容冲突；
-   判定拒绝与目标不符均不核销、不占用 `request_key`。
+   判定拒绝与目标不符均不核销、不占用 `request_key`；
+8. **HMAC 密钥轮换** —— 对已注册签发主体提交新密钥即可原子轮换：轮换后**新提交**的链只按新密钥
+   验签（旧密钥签出的新链一律 `bad_signature`）；轮换**前**保存的链永久钉扎（pin）在提交时的
+   密钥版本上，查询 / 只读求值 / 首次核销继续用旧版本重验，结论与撤销处理完全不变；
+   既有无效链不会因新密钥“恰好匹配”而复活。提交与轮换靠同一写锁互斥，链的密钥归属与其
+   提交验签结果严格一致；任何响应都只返回版本号、不回读密钥。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -65,6 +70,9 @@ PYTHONPATH=. python scripts/demo_chain.py print
 
 # 提交 + 重放 + 求值（默认 http://127.0.0.1:8000，可用 BASE_URL 覆盖）
 PYTHONPATH=. python scripts/demo_chain.py submit
+
+# HMAC 密钥轮换端到端演示（轮换前/后的签名、求值与核销；面向全新数据库）
+PYTHONPATH=. python scripts/demo_key_rotation.py
 ```
 
 ---
@@ -143,6 +151,137 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 
 - `201` 注册成功；`409` 主体已存在。
 
+### `POST /api/v1/principals/{name}/keys/rotate`
+
+为**已注册**签发主体轮换 HMAC 密钥。请求体只提交新密钥；响应**只返回主体名与版本号**，
+任何接口（轮换、链查询、求值、核销）都不会回读或泄露密钥内容。
+
+```json
+{ "hmac_secret": "s3cr3t-v2" }
+```
+
+```json
+{
+  "name": "service-a",
+  "previous_version": 1,
+  "current_version": 2,
+  "rotated_at": "2026-10-04T09:00:00.000000Z"
+}
+```
+
+- `200 OK`：轮换成功——在同一 `BEGIN IMMEDIATE` 事务内“追加新版本密钥 + 推进当前版本指针”，
+  失败整体回滚，**不留下部分切换**；
+- `404 Not Found`：主体未注册（请先 `POST /api/v1/principals`）；
+- `409 Conflict`：新密钥与当前密钥完全相同（不产生新版本，版本指针不变）。
+
+#### 轮换语义（版本钉扎 / key pinning）
+
+- 每条链在**提交事务内**快照当时每个签发者的当前密钥版本，钉扎到该链（`chain_key_bindings`）。
+  链提交与密钥轮换都取 SQLite 写锁互斥，因此**链归属的密钥版本与其提交时的验签结果必然一致**；
+- 轮换后**新提交**的链：只按新密钥验签——旧密钥签出的新链为 `bad_signature`；
+- 轮换**前**已保存的链：永远按钉扎的旧版本密钥重验。链查询中的 `integrity`、只读
+  `/evaluate`、以及首次 `/redeem` 的实时重算都得到与轮换前相同的验签结论，撤销照常生效；
+- 既有**无效链**不会因轮换而复活：提交时签发者未注册的节点（`unknown_issuer`）保持未注册
+  语义；提交时坏签名的节点（`bad_signature`）钉扎在旧版本，即使新密钥恰好等于误签串也仍失败；
+- 链查询响应中的 `key_bindings` 给出钉扎的“签发者 → 密钥版本”（仅版本号 + 钉扎时间，无密钥）。
+
+#### 可执行 HTTP 示例（轮换前/后的签名、求值与核销）
+
+下列示例可直接复制执行，覆盖：轮换前旧链提交 → 轮换 → 旧密钥新链失败 / 新密钥新链通过 →
+旧链查询 / 求值 / 首次核销结论不变 → 同键同内容核销重放 → 旧链撤销照常生效。
+密钥签名用仓库自带的 Python 原语生成（也可严格按[签名规范](#规范化-json-与签名重要)自行构造）。
+
+```bash
+BASE=http://localhost:8000
+RUN=$(date -u +%Y%m%d%H%M%S)
+OLD_CHAIN="demo-rotation-old-$RUN"      # 轮换前提交
+STALE_CHAIN="demo-rotation-stale-$RUN"  # 轮换后旧密钥签的失败链
+NEW_CHAIN="demo-rotation-new-$RUN"      # 轮换后新密钥签的链
+REDEEM_KEY="demo-rotation-redeem-$RUN"
+
+# 用 Python 生成“按指定密钥签名”的提交报文（字段与 scripts/demo_key_rotation.py 一致）
+gen_chain() {
+  CHAIN_ID="$1" ISSUER_SECRET="$2" PYTHONPATH=. python3 - <<'PY'
+import json, os
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+cid, sec = os.environ["CHAIN_ID"], os.environ["ISSUER_SECRET"]
+now = datetime.now(timezone.utc); nb = now - timedelta(days=1); na = now + timedelta(days=30)
+def tok(tid, parent, issuer, subject, secret, path, methods):
+    t = {"token_id": tid, "parent_id": parent, "chain_id": cid, "issuer": issuer,
+         "subject": subject, "path_pattern": path, "methods": methods,
+         "not_before": nb.strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "not_after": na.strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "allow_ip": None, "signature": ""}
+    t["signature"] = compute_signature(t, secret)
+    return t
+root = tok("token-root", None, "root", "service-a",
+           os.getenv("ROOT_HMAC_SECRET", "dev-root-secret-change-me"),
+           "/files/**", ["GET", "POST"])
+leaf = tok("token-leaf", "token-root", "service-a", "service-b-worker",
+           sec, "/files/reports/*", ["GET"])
+print(json.dumps({"chain_id": cid, "tokens": [root, leaf]}))
+PY
+}
+
+# ── 1. 轮换前：旧密钥签名的链提交成功 ──────────────────────────────
+gen_chain "$OLD_CHAIN" "demo-secret-service-a" > /tmp/old-chain.json
+curl -sS -X POST "$BASE/api/v1/chains" -H 'Content-Type: application/json' \
+  -d @/tmp/old-chain.json | python3 -c 'import sys,json;b=json.load(sys.stdin);print("allow =",b["integrity"]["allow"])'
+# allow = True
+
+# ── 2. 轮换 service-a 的 HMAC 密钥（响应无密钥，仅版本号） ─────────
+curl -sS -X POST "$BASE/api/v1/principals/service-a/keys/rotate" \
+  -H 'Content-Type: application/json' \
+  -d '{"hmac_secret":"demo-secret-service-a-rotated"}'
+# {"name":"service-a","previous_version":1,"current_version":2,"rotated_at":"…"}
+
+# ── 3. 轮换后：旧密钥签的新链必须 bad_signature ───────────────────
+gen_chain "$STALE_CHAIN" "demo-secret-service-a" > /tmp/stale-chain.json
+curl -sS -X POST "$BASE/api/v1/chains" -H 'Content-Type: application/json' \
+  -d @/tmp/stale-chain.json | python3 -c 'import sys,json;b=json.load(sys.stdin);print(b["integrity"]["first_failed_node"],b["integrity"]["first_failed_reason"])'
+# token-leaf bad_signature
+
+# ── 4. 轮换后：新密钥签的新链通过，钉扎在 v2 ──────────────────────
+gen_chain "$NEW_CHAIN" "demo-secret-service-a-rotated" > /tmp/new-chain.json
+curl -sS -X POST "$BASE/api/v1/chains" -H 'Content-Type: application/json' \
+  -d @/tmp/new-chain.json | python3 -c 'import sys,json;b=json.load(sys.stdin);print("allow =",b["integrity"]["allow"])'
+# allow = True
+
+# ── 5. 轮换前的旧链：查询（钉扎 v1）与只读求值结论不变 ────────────
+curl -sS "$BASE/api/v1/chains/$OLD_CHAIN" | python3 -c 'import sys,json;b=json.load(sys.stdin);print("bindings =",{x["issuer"]:x["key_version"] for x in b["key_bindings"]})'
+# bindings = {'root': 1, 'service-a': 1}
+AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+curl -sS -X POST "$BASE/api/v1/chains/$OLD_CHAIN/evaluate" \
+  -H 'Content-Type: application/json' \
+  -d "{\"request_path\":\"/files/reports/x\",\"method\":\"GET\",\"at\":\"$AT\"}" \
+  | python3 -c 'import sys,json;print("decision =",json.load(sys.stdin)["decision"])'
+# decision = allow
+
+# ── 6. 旧链首次核销仍 allow（201）；同键同内容重放回放首次结果（200）
+curl -sS -X POST "$BASE/api/v1/chains/$OLD_CHAIN/redeem" -H 'Content-Type: application/json' \
+  -d "{\"token_id\":\"token-leaf\",\"request_key\":\"$REDEEM_KEY\",\"request_path\":\"/files/reports/x\",\"method\":\"GET\"}" \
+  | python3 -c 'import sys,json;b=json.load(sys.stdin);print(b["redeemed"],b["decision"])'
+# True allow
+curl -sS -X POST "$BASE/api/v1/chains/$OLD_CHAIN/redeem" -H 'Content-Type: application/json' \
+  -d "{\"token_id\":\"token-leaf\",\"request_key\":\"$REDEEM_KEY\",\"request_path\":\"/files/reports/x\",\"method\":\"GET\"}" \
+  | python3 -c 'import sys,json;b=json.load(sys.stdin);print(b["replayed"],b["decision"])'
+# True allow
+
+# ── 7. 撤销对旧链照常生效（即使其钉扎的是旧密钥版本） ─────────────
+curl -sS -X POST "$BASE/api/v1/chains/$OLD_CHAIN/revocations" -H 'Content-Type: application/json' \
+  -d "{\"token_id\":\"token-leaf\",\"effective_at\":\"$AT\",\"reason\":\"密钥轮换演练后撤销\",\"request_key\":\"demo-rotation-revoke-$RUN\"}" \
+  | python3 -c 'import sys,json;print("affected =",json.load(sys.stdin)["affected_token_ids"])'
+# affected = ['token-leaf']
+curl -sS -X POST "$BASE/api/v1/chains/$OLD_CHAIN/evaluate" -H 'Content-Type: application/json' \
+  -d "{\"request_path\":\"/files/reports/x\",\"method\":\"GET\",\"at\":\"$AT\"}" \
+  | python3 -c 'import sys,json;b=json.load(sys.stdin);print(b["decision"],b["first_failed_reason"])'
+# decision = deny / revoked
+```
+
+> 仓库还附带等价的端到端脚本：`PYTHONPATH=. python scripts/demo_key_rotation.py`
+> （面向全新数据库；轮换是单向的，重复演练请先 `docker compose down -v` 重置）。
+
 ### `POST /api/v1/chains`
 
 提交一条能力链。
@@ -192,8 +331,9 @@ PYTHONPATH=. python scripts/demo_chain.py submit
 
 ### `GET /api/v1/chains/{chain_id}`
 
-返回存储的链：令牌列表、内容哈希、创建时间、提交时的完整性报告，以及按追加顺序排列的
-**撤销事件列表** `revocations` 与**成功核销记录列表** `redemptions`（从未发生时均为 `[]`）；
+返回存储的链：令牌列表、内容哈希、创建时间、提交时的完整性报告，按追加顺序排列的
+**撤销事件列表** `revocations` 与**成功核销记录列表** `redemptions`（从未发生时均为 `[]`），
+以及链提交时钉扎的**签发者密钥版本** `key_bindings`（只含版本号与钉扎时间，不含密钥）；
 不存在返回 `404`。
 
 ```json
@@ -228,9 +368,17 @@ PYTHONPATH=. python scripts/demo_chain.py submit
       "redeemed_at": "2026-10-01T09:00:00+00:00",
       "created_at": "2026-10-01T09:00:00+00:00"
     }
+  ],
+  "key_bindings": [
+    { "issuer": "root", "key_version": 1, "bound_at": "2026-10-01T00:00:00+00:00" },
+    { "issuer": "service-a", "key_version": 1, "bound_at": "2026-10-01T00:00:00+00:00" },
+    { "issuer": "service-b", "key_version": 2, "bound_at": "2026-10-01T00:00:00+00:00" }
   ]
 }
 ```
+
+> `key_bindings` 是链提交事务内快照的“签发者 → 主体密钥版本”：该链此后的验签
+> （含只读求值与核销的实时重算）永远按这些版本取密钥，与主体当前是否已轮换无关。
 
 ### `POST /api/v1/chains/{chain_id}/revocations`
 
@@ -465,7 +613,7 @@ token["signature"] = compute_signature(token, issuer_secret)
 | ------------------------ | ------------------------------ | -------------------------------------- |
 | `DATABASE_PATH`          | `/data/capabilities.db`        | SQLite 文件路径（目录自动创建）        |
 | `ROOT_PRINCIPAL`         | `root`                         | 根授权唯一合法签发者                   |
-| `ROOT_HMAC_SECRET`       | `dev-root-secret-change-me`    | 根主体 HMAC 密钥，**生产必须覆盖**     |
+| `ROOT_HMAC_SECRET`       | `dev-root-secret-change-me`    | 根主体 HMAC 密钥，**生产必须覆盖**；运行期也可通过轮换接口更换（已存链按钉扎版本继续有效） |
 | `SEED_DEMO_PRINCIPALS`   | `true`                         | 是否在启动时播种演示主体               |
 
 ---
@@ -475,14 +623,15 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销
+│   ├── main.py        # FastAPI 路由：主体注册/HMAC 密钥轮换、提交/重放/冲突/查询/求值/撤销/核销
 │   ├── models.py      # Pydantic 模型与输入校验
 │   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语、内容指纹
 │   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎、链末端识别与轨迹
-│   ├── database.py    # SQLite 初始化、主体/链/撤销/核销持久化
+│   ├── database.py    # SQLite：版本化主体密钥（轮换历史）、链密钥钉扎、撤销/核销持久化与旧库迁移
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：82 个用例（端到端 API、原语单测、撤销审计、一次性核销）
+├── scripts/demo_key_rotation.py
+├── tests/             # pytest：97 个用例（端到端 API、原语单测、撤销审计、一次性核销、密钥轮换）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

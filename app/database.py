@@ -6,7 +6,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Callable, Iterator
 
 from .config import settings
 from .models import (
@@ -18,9 +18,23 @@ from .models import (
 )
 
 SCHEMA = """
+-- 签发主体：current_version 指向当前生效密钥；轮换只推进版本指针。
 CREATE TABLE IF NOT EXISTS principals (
-    name        TEXT PRIMARY KEY,
-    hmac_secret TEXT NOT NULL
+    name            TEXT PRIMARY KEY,
+    current_version INTEGER NOT NULL CHECK (current_version >= 1),
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- 主体密钥历史（只追加）：轮换写入新版本，旧版本永久保留，
+-- 轮换前提交的链继续按钉扎的旧版本重验。任何接口都不回读该列给客户端。
+CREATE TABLE IF NOT EXISTS principal_keys (
+    name        TEXT NOT NULL,
+    version     INTEGER NOT NULL CHECK (version >= 1),
+    hmac_secret TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (name, version),
+    FOREIGN KEY (name) REFERENCES principals (name)
 );
 
 CREATE TABLE IF NOT EXISTS chains (
@@ -28,6 +42,17 @@ CREATE TABLE IF NOT EXISTS chains (
     content_sha256 TEXT NOT NULL,
     report_json    TEXT NOT NULL,
     created_at     TEXT NOT NULL
+);
+
+-- 链在提交事务所内钉扎的“签发者 -> 密钥版本”快照：
+-- 后续查询 / 只读求值 / 核销始终按此版本取密钥，与主体当前版本无关。
+CREATE TABLE IF NOT EXISTS chain_key_bindings (
+    chain_id    TEXT NOT NULL,
+    issuer      TEXT NOT NULL,
+    key_version INTEGER NOT NULL,
+    bound_at    TEXT NOT NULL,
+    PRIMARY KEY (chain_id, issuer),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 
 CREATE TABLE IF NOT EXISTS tokens (
@@ -121,29 +146,263 @@ def get_db() -> Iterator[sqlite3.Connection]:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    _migrate_legacy_principals(conn)
     conn.executescript(SCHEMA)
     if settings.seed_demo_principals:
+        now = _now_iso()
+        # 已存在（含迁移而来）的演示主体不覆盖其版本指针
         conn.executemany(
-            "INSERT OR IGNORE INTO principals (name, hmac_secret) VALUES (?, ?)",
-            list(DEMO_PRINCIPALS.items()),
+            "INSERT OR IGNORE INTO principals "
+            "(name, current_version, created_at, updated_at) VALUES (?, 1, ?, ?)",
+            [(name, now, now) for name in DEMO_PRINCIPALS],
+        )
+        # 主体缺失 v1 时补插演示密钥；已轮换过的主体保留其历史密钥
+        conn.executemany(
+            "INSERT OR IGNORE INTO principal_keys (name, version, hmac_secret, created_at) "
+            "VALUES (?, 1, ?, ?)",
+            [(name, secret, now) for name, secret in DEMO_PRINCIPALS.items()],
         )
     conn.commit()
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        r["name"]
+        for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
+def _migrate_legacy_principals(conn: sqlite3.Connection) -> None:
+    """把旧版单列密钥 principals(name,hmac_secret) 迁移到版本化结构。
+
+    迁移与后续建表在同一事务中：任一步失败整体回滚，不存在部分切换。
+    迁移后还为既有链回填 v1 绑定，使其永远按轮换前密钥重验。
+    """
+    tables = {
+        r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "principals" not in tables:
+        return
+    columns = _table_columns(conn, "principals")
+    if "current_version" in columns:
+        return  # 已是版本化结构
+
+    now = _now_iso()
+    conn.execute("ALTER TABLE principals RENAME TO principals_legacy")
+    conn.executescript(SCHEMA)
+    legacy = conn.execute(
+        "SELECT name, hmac_secret FROM principals_legacy"
+    ).fetchall()
+    for row in legacy:
+        conn.execute(
+            "INSERT INTO principals (name, current_version, created_at, updated_at) "
+            "VALUES (?, 1, ?, ?)",
+            (row["name"], now, now),
+        )
+        conn.execute(
+            "INSERT INTO principal_keys (name, version, hmac_secret, created_at) "
+            "VALUES (?, 1, ?, ?)",
+            (row["name"], row["hmac_secret"], now),
+        )
+    # 旧链提交时存在的签发者一律钉扎在 v1（只回填已注册签发者，
+    # 与提交时 unknown_issuer 的既有结论保持一致）。
+    conn.execute(
+        "INSERT OR IGNORE INTO chain_key_bindings (chain_id, issuer, key_version, bound_at) "
+        "SELECT DISTINCT t.chain_id, json_extract(t.token_json, '$.issuer'), 1, ? "
+        "FROM tokens t "
+        "JOIN principals p ON p.name = json_extract(t.token_json, '$.issuer')",
+        (now,),
+    )
+    conn.execute("DROP TABLE principals_legacy")
+    conn.commit()
+
+
 def get_secret(conn: sqlite3.Connection, name: str) -> str | None:
+    """取主体**当前**版本密钥（仅供注册 / 轮换管理用途）。
+
+    已存链的重验不得使用本函数——应通过
+    :class:`SubmissionSecretResolver`（提交时）或
+    :func:`bound_secret_lookup`（已存链）按钉扎版本取密钥。
+    """
     row = conn.execute(
-        "SELECT hmac_secret FROM principals WHERE name = ?", (name,)
+        "SELECT k.hmac_secret AS hmac_secret FROM principals p "
+        "JOIN principal_keys k ON k.name = p.name AND k.version = p.current_version "
+        "WHERE p.name = ?",
+        (name,),
     ).fetchone()
     return row["hmac_secret"] if row else None
 
 
+def principal_current_version(conn: sqlite3.Connection, name: str) -> int | None:
+    row = conn.execute(
+        "SELECT current_version FROM principals WHERE name = ?", (name,)
+    ).fetchone()
+    return row["current_version"] if row else None
+
+
 def upsert_principal(conn: sqlite3.Connection, name: str, secret: str) -> bool:
-    """注册主体；已存在返回 False。"""
+    """注册主体及其 v1 密钥（同一事务内两行）；已存在返回 False。"""
+    now = _now_iso()
     cur = conn.execute(
-        "INSERT INTO principals (name, hmac_secret) VALUES (?, ?)",
-        (name, secret),
+        "INSERT INTO principals (name, current_version, created_at, updated_at) "
+        "VALUES (?, 1, ?, ?)",
+        (name, now, now),
+    )
+    conn.execute(
+        "INSERT INTO principal_keys (name, version, hmac_secret, created_at) "
+        "VALUES (?, 1, ?, ?)",
+        (name, secret, now),
     )
     return cur.rowcount == 1
+
+
+def rotate_principal_secret(
+    conn: sqlite3.Connection, name: str, new_secret: str
+) -> int:
+    """在同一事务内为主体追加一个新版本密钥并推进当前版本指针。
+
+    返回新版本号。主体不存在抛 :class:`LookupError`；
+    新密钥与当前密钥完全相同抛 :class:`ValueError`（调用方映射为 409）。
+    """
+    row = conn.execute(
+        "SELECT current_version FROM principals WHERE name = ?", (name,)
+    ).fetchone()
+    if row is None:
+        raise LookupError(name)
+    current_version = row["current_version"]
+    current_secret = conn.execute(
+        "SELECT hmac_secret FROM principal_keys WHERE name = ? AND version = ?",
+        (name, current_version),
+    ).fetchone()["hmac_secret"]
+    if hmac_compare_strings(current_secret, new_secret):
+        raise ValueError("新密钥不得与当前密钥相同")
+    next_version = current_version + 1
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO principal_keys (name, version, hmac_secret, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (name, next_version, new_secret, now),
+    )
+    conn.execute(
+        "UPDATE principals SET current_version = ?, updated_at = ? WHERE name = ?",
+        (next_version, now, name),
+    )
+    return next_version
+
+
+def hmac_compare_strings(a: str, b: str) -> bool:
+    import hmac as _hmac
+
+    return _hmac.compare_digest(a, b)
+
+
+def get_secret_for_issuer_version(
+    conn: sqlite3.Connection, issuer: str, version: int
+) -> str | None:
+    """取某主体某历史版本密钥（供已存链按钉扎版本重验）。"""
+    row = conn.execute(
+        "SELECT hmac_secret FROM principal_keys WHERE name = ? AND version = ?",
+        (issuer, version),
+    ).fetchone()
+    return row["hmac_secret"] if row else None
+
+
+def save_chain_key_bindings(
+    conn: sqlite3.Connection,
+    chain_id: str,
+    bindings: dict[str, int],
+) -> None:
+    """把提交事务所内快照到的“签发者 -> 当前密钥版本”钉扎到链上。"""
+    now = _now_iso()
+    conn.executemany(
+        "INSERT INTO chain_key_bindings (chain_id, issuer, key_version, bound_at) "
+        "VALUES (?, ?, ?, ?)",
+        [(chain_id, issuer, version, now) for issuer, version in bindings.items()],
+    )
+
+
+def load_chain_key_bindings(
+    conn: sqlite3.Connection, chain_id: str
+) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT issuer, key_version FROM chain_key_bindings WHERE chain_id = ?",
+        (chain_id,),
+    ).fetchall()
+    return {r["issuer"]: r["key_version"] for r in rows}
+
+
+def load_chain_key_binding_records(
+    conn: sqlite3.Connection, chain_id: str
+) -> list[dict]:
+    rows = conn.execute(
+        "SELECT issuer, key_version, bound_at FROM chain_key_bindings "
+        "WHERE chain_id = ? ORDER BY issuer",
+        (chain_id,),
+    ).fetchall()
+    return [
+        {
+            "issuer": r["issuer"],
+            "key_version": r["key_version"],
+            "bound_at": datetime.fromisoformat(r["bound_at"]),
+        }
+        for r in rows
+    ]
+
+
+class SubmissionSecretResolver:
+    """提交时的密钥解析器（在 ``BEGIN IMMEDIATE`` 事务内使用）。
+
+    每个签发者首次取密钥时快照其**当前版本**；该快照一方面立即用于本次验签，
+    另一方面随链钉扎落库——因此“验签用哪版密钥”与“链归属哪版密钥”必然一致。
+    轮换事务与提交事务靠写锁互斥，不存在跨边界的版本漂移。
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._snapshot: dict[str, int | None] = {}
+
+    def __call__(self, issuer: str) -> str | None:
+        if issuer not in self._snapshot:
+            self._snapshot[issuer] = principal_current_version(
+                self._conn, issuer
+            )
+        version = self._snapshot[issuer]
+        if version is None:
+            return None
+        return get_secret_for_issuer_version(self._conn, issuer, version)
+
+    def bindings(self) -> dict[str, int]:
+        """仅包含解析时确实已注册（取到过版本）的签发者。"""
+        return {
+            issuer: version
+            for issuer, version in self._snapshot.items()
+            if version is not None
+        }
+
+
+def bound_secret_lookup(
+    conn: sqlite3.Connection, chain_id: str
+) -> "Callable[[str], str | None]":
+    """已存链的密钥查询：严格按链钉扎版本，忽略主体当前版本。
+
+    未钉扎的签发者（提交时未注册）恒返回 None，保留 ``unknown_issuer``
+    的既有结论——主体事后注册 / 轮换都不会让既有无效链复活。
+    """
+    pinned = load_chain_key_bindings(conn, chain_id)
+
+    def _lookup(issuer: str) -> str | None:
+        version = pinned.get(issuer)
+        if version is None:
+            return None
+        return get_secret_for_issuer_version(conn, issuer, version)
+
+    return _lookup
 
 
 def save_chain(
@@ -211,6 +470,7 @@ def load_chain_record(conn: sqlite3.Connection, chain_id: str) -> dict | None:
         "tokens": submission.tokens,
         "revocations": load_revocations(conn, chain_id),
         "redemptions": load_redemptions(conn, chain_id),
+        "key_bindings": load_chain_key_binding_records(conn, chain_id),
     }
 
 

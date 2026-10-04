@@ -235,6 +235,8 @@ class ChainRecord(BaseModel):
     tokens: list[CapabilityToken]
     revocations: list["RevocationEvent"] = Field(default_factory=list)
     redemptions: list["RedemptionEvent"] = Field(default_factory=list)
+    # 链提交时钉扎的“签发者 -> 主体密钥版本”（不含任何密钥内容）
+    key_bindings: list["KeyBinding"] = Field(default_factory=list)
 
 
 class EvaluateResult(BaseModel):
@@ -326,6 +328,31 @@ class PrincipalIn(BaseModel):
 
 class PrincipalOut(BaseModel):
     name: str
+
+
+class KeyRotateIn(BaseModel):
+    """HMAC 密钥轮换请求：提交已注册主体的新密钥（密钥只用于入参，绝不回显）。"""
+
+    hmac_secret: str = Field(
+        min_length=1, description="轮换后的新 HMAC 密钥；不得与当前密钥相同"
+    )
+
+
+class KeyBinding(BaseModel):
+    """链在提交时钉扎的某个签发者密钥版本（审计展示用，不含密钥）。"""
+
+    issuer: str
+    key_version: int
+    bound_at: datetime
+
+
+class KeyRotateOut(BaseModel):
+    """轮换结果：只暴露主体名与版本号；旧版本仍被轮换前的链钉扎使用。"""
+
+    name: str
+    previous_version: int
+    current_version: int
+    rotated_at: datetime
 
 
 class ConflictDetail(BaseModel):

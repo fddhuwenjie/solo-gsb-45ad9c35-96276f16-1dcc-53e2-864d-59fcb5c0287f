@@ -10,9 +10,10 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from .database import (
+    SubmissionSecretResolver,
+    bound_secret_lookup,
     get_conn,
     get_db,
-    get_secret,
     init_db,
     insert_redemption,
     insert_revocation,
@@ -24,7 +25,10 @@ from .database import (
     load_revocation_for_token,
     load_revocations,
     load_submission,
+    principal_current_version,
+    rotate_principal_secret,
     save_chain,
+    save_chain_key_bindings,
     token_exists,
     upsert_principal,
 )
@@ -35,6 +39,8 @@ from .models import (
     ConflictDetail,
     EvaluateRequest,
     EvaluateResult,
+    KeyRotateIn,
+    KeyRotateOut,
     PrincipalIn,
     PrincipalOut,
     RedemptionEvent,
@@ -65,13 +71,9 @@ app = FastAPI(
         "并强制路径 / 方法 / 时间窗 / IP 网段只能逐级收窄。"
         "支持按时间生效的不可变撤销事件、请求级判定，以及链末端令牌的一次性访问核销。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
-
-
-def _secret_lookup(conn: sqlite3.Connection):
-    return lambda name: get_secret(conn, name)
 
 
 @app.get("/health")
@@ -97,6 +99,56 @@ def register_principal(
 
 
 @app.post(
+    "/api/v1/principals/{name}/keys/rotate",
+    response_model=KeyRotateOut,
+    status_code=200,
+)
+def rotate_principal_key(
+    name: str,
+    payload: KeyRotateIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> KeyRotateOut:
+    """为已注册签发主体轮换 HMAC 密钥。
+
+    - 轮换在同一 ``BEGIN IMMEDIATE`` 事务内完成“追加新版本 + 推进当前版本指针”，
+      失败整体回滚，不留下部分切换；
+    - 轮换后**新提交**的链按新版本密钥验签；旧密钥签发的新链不得通过；
+    - 轮换**前**提交的链继续钉扎使用旧版本密钥重验（查询 / 只读求值 / 首次核销
+      结论均不变，撤销照常生效）；
+    - 与链提交并发时，写锁互斥保证链钉扎的密钥版本与其提交验签时刻一致；
+    - 响应只含主体名与版本号，**任何响应都不回读 / 泄露密钥内容**。
+
+    - `200 OK`：轮换成功（语义为动作执行，幂等不适用：换同密钥返回 409）；
+    - `404 Not Found`：主体尚未注册；
+    - `409 Conflict`：新密钥与当前密钥完全相同（不产生新版本）。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    previous = principal_current_version(conn, name)
+    if previous is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"主体 {name!r} 未注册，请先 POST /api/v1/principals",
+        )
+    try:
+        new_version = rotate_principal_secret(conn, name, payload.hmac_secret)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": "新 HMAC 密钥与当前密钥完全相同，轮换未执行",
+                "name": name,
+                "current_version": previous,
+            },
+        )
+    return KeyRotateOut(
+        name=name,
+        previous_version=previous,
+        current_version=new_version,
+        rotated_at=datetime.now(timezone.utc),
+    )
+
+
+@app.post(
     "/api/v1/chains",
     response_model=SubmissionResult,
     responses={409: {"model": ConflictDetail}},
@@ -111,16 +163,27 @@ def submit_chain(
     - 相同 chain_id 且内容完全一致：幂等返回 200，``replayed=true``；
     - 相同 chain_id 但内容变化：返回 409 冲突；
     - 新 chain_id：持久化并返回 201。完整性失败也会持久化（含失败轨迹）。
+
+    验签在 ``BEGIN IMMEDIATE`` 写事务内进行：本次取到的每个签发者当前密钥版本
+    会随链钉扎（chain_key_bindings）并在同一事务落库；密钥轮换同样取写锁，
+    故链的密钥归属与其提交时验签结果严格一致。
     """
+    # 立即取写锁：串行化“按当前版本验签 + 钉扎落库”与密钥轮换
+    conn.execute("BEGIN IMMEDIATE")
     received_hash = canonical_submission_hash(
         submission.chain_id, submission.tokens
     )
     existing_hash = _existing_hash(conn, submission.chain_id)
 
-    report, _ = validate_chain(submission, _secret_lookup(conn))
+    resolver = SubmissionSecretResolver(conn)
 
     if existing_hash is not None:
         if existing_hash == received_hash:
+            # 幂等重放：按该链**已钉扎**的密钥版本重算（而非主体当前版本），
+            # 保证轮换后重放返回的验签结论仍与首次提交一致。
+            report, _ = validate_chain(
+                submission, bound_secret_lookup(conn, submission.chain_id)
+            )
             result = SubmissionResult(
                 chain_id=submission.chain_id, replayed=True, integrity=report
             )
@@ -141,7 +204,10 @@ def submit_chain(
             },
         )
 
+    report, _ = validate_chain(submission, resolver)
     save_chain(conn, submission, received_hash, report)
+    # 与验签同一事务钉扎密钥版本（仅提交时已注册、确实参与解析的签发者）
+    save_chain_key_bindings(conn, submission.chain_id, resolver.bindings())
     result = SubmissionResult(
         chain_id=submission.chain_id, replayed=False, integrity=report
     )
@@ -179,7 +245,10 @@ def evaluate_chain(
         raise HTTPException(status_code=404, detail=f"chain_id {chain_id!r} 不存在")
     revocations = load_revocations(conn, chain_id)
     return evaluate_request(
-        submission, payload, _secret_lookup(conn), revocations=revocations
+        submission,
+        payload,
+        bound_secret_lookup(conn, chain_id),
+        revocations=revocations,
     )
 
 
@@ -300,7 +369,7 @@ def redeem_chain(
     decision = evaluate_request(
         submission,
         evaluation,
-        _secret_lookup(conn),
+        bound_secret_lookup(conn, chain_id),
         revocations=load_revocations(conn, chain_id),
     )
 
